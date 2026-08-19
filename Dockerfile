@@ -1,7 +1,3 @@
-# Той самий базовий образ, що в ДЗ #5 (node:22-slim).
-# `docker compose run --rm api npm test` виконується на стадії builder,
-# де є devDependencies (typescript, @types/node).
-
 FROM node:22-slim AS builder
 WORKDIR /app
 
