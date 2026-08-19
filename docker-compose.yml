@@ -1,0 +1,12 @@
+name: mini-nest
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    image: mini-nest
+    working_dir: /app
+    environment:
+      NODE_ENV: test
