@@ -11,15 +11,13 @@ export class Container {
     return this;
   }
 
-  resolve<T>(target: Token<T>, path: string[] = []): T {
-    const name = tokenName(target);
-
+  resolve<T>(target: Token<T>, path: Set<Token> = new Set()): T {
     if (this.singletons.has(target)) {
       return this.singletons.get(target) as T;
     }
 
-    if (path.includes(name)) {
-      throw new Error(`цикл залежностей: ${[...path, name].join(' -> ')}`);
+    if (path.has(target)) {
+      throw new Error(`цикл залежностей: ${formatPath(path, target)}`);
     }
 
     if (this.providers.has(target)) {
@@ -27,24 +25,27 @@ export class Container {
     }
 
     if (typeof target !== 'function') {
-      throw new Error(`No provider for token ${name}`);
+      throw new Error(`No provider for token ${tokenName(target)}: ${formatPath(path, target)}`);
     }
 
-    if (!Reflect.getMetadata(INJECTABLE, target)) {
-      throw new Error(`${name} не позначений @Injectable()`);
+    if (!Reflect.getOwnMetadata(INJECTABLE, target)) {
+      throw new Error(`${tokenName(target)} не позначений @Injectable()`);
     }
 
-    const deps = (Reflect.getMetadata('design:paramtypes', target) ?? []) as Token[];
-    const injected = (Reflect.getMetadata(INJECT_TOKENS, target) ?? {}) as Record<
+    const nextPath = new Set(path);
+    nextPath.add(target);
+
+    const deps = (Reflect.getOwnMetadata('design:paramtypes', target) ?? []) as Token[];
+    const injected = (Reflect.getOwnMetadata(INJECT_TOKENS, target) ?? {}) as Record<
       number,
       Token
     >;
     const args = deps.map((dep, index) =>
-      this.resolve(injected[index] ?? dep, [...path, name]),
+      this.resolve(injected[index] ?? dep, nextPath),
     );
 
     const instance = new (target as Constructor<T>)(...args);
-    const scope = (Reflect.getMetadata(SCOPE, target) as Scope | undefined) ?? 'singleton';
+    const scope = (Reflect.getOwnMetadata(SCOPE, target) as Scope | undefined) ?? 'singleton';
 
     if (scope === 'singleton') {
       this.singletons.set(target, instance);
@@ -56,4 +57,8 @@ export class Container {
 
 function tokenName(token: Token): string {
   return typeof token === 'function' ? token.name : String(token);
+}
+
+function formatPath(path: Set<Token>, current: Token): string {
+  return [...path, current].map(tokenName).join(' -> ');
 }

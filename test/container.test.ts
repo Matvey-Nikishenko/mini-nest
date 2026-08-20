@@ -85,4 +85,63 @@ describe('Container', () => {
       },
     );
   });
+
+  it('does not treat two classes with the same name as a cycle', () => {
+    const DupA = (() => {
+      @Injectable()
+      class Dup {}
+      return Dup;
+    })();
+    const DupB = (() => {
+      @Injectable()
+      class Dup {}
+      return Dup;
+    })();
+
+    @Injectable()
+    class Holder {
+      constructor(readonly first: object, readonly second: object) {}
+    }
+    Reflect.defineMetadata('design:paramtypes', [DupA, DupB], Holder);
+
+    const holder = new Container().resolve(Holder);
+    assert.ok(holder.first instanceof DupA);
+    assert.ok(holder.second instanceof DupB);
+  });
+
+  it('does not inherit parent metadata on an undecorated subclass', () => {
+    @Injectable()
+    class Dep {
+      readonly id = 'dep';
+    }
+
+    @Injectable()
+    class Base {
+      constructor(readonly dep: Dep) {}
+    }
+
+    class Child extends Base {}
+
+    assert.throws(
+      () => new Container().resolve(Child),
+      /не позначений @Injectable/,
+    );
+  });
+
+  it('names the resolve chain when a token has no provider', () => {
+    @Injectable()
+    class AppService {
+      constructor(@Inject(CONFIG) readonly config: object) {}
+    }
+
+    assert.throws(
+      () => new Container().resolve(AppService),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /No provider for token/);
+        assert.match(error.message, /AppService/);
+        return true;
+      },
+    );
+  });
 });
