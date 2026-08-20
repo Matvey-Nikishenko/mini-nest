@@ -1,0 +1,22 @@
+{
+  "name": "mini-nest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Part 1: IoC-контейнер на reflect-metadata (mini-Nest)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test dist/test/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.2",
+    "typescript": "~6.0.3"
+  }
+}
