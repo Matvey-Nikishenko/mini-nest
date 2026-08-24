@@ -7,3 +7,20 @@ export type Scope = 'singleton' | 'transient';
 export interface InjectableOptions {
   scope?: Scope;
 }
+
+export type HttpMethod = 'GET' | 'POST';
+
+export type ParamSource = 'body' | 'param' | 'query';
+
+export interface RouteParamMeta {
+  type: ParamSource;
+  name?: string;
+}
+
+export type RouteParamsMap = Record<number, RouteParamMeta>;
+
+export interface RouteMeta {
+  method: HttpMethod;
+  path: string;
+  handlerName: string;
+}
