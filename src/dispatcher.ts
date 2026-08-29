@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Container } from './container.js';
 import { collectRoutes, matchRoute, type CompiledRoute } from './router.js';
 import { ValidationError, ValidationPipe } from './pipes/validation.pipe.js';
+import { HTTP_CODE } from './tokens.js';
 import type { Constructor } from './types.js';
 
 export class HttpError extends Error {
@@ -21,6 +22,17 @@ export interface MiniNestApp {
   listen: (port?: number) => Promise<string>;
   close: () => Promise<void>;
 }
+
+type RequestContext = {
+  req: IncomingMessage;
+  res: ServerResponse;
+  routes: CompiledRoute[];
+  container: Container;
+  url: URL;
+  match?: { route: CompiledRoute; pathParams: Record<string, string> };
+  body?: unknown;
+  result?: unknown;
+};
 
 const pipe = new ValidationPipe();
 
@@ -62,29 +74,70 @@ async function handle(
   routes: CompiledRoute[],
   container: Container,
 ): Promise<void> {
+  const ctx: RequestContext = {
+    req,
+    res,
+    routes,
+    container,
+    url: new URL(req.url ?? '/', 'http://127.0.0.1'),
+  };
+
   try {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const matched = matchRoute(routes, req.method ?? 'GET', url.pathname);
-    if (!matched) {
-      throw new HttpError(404, 'Not Found');
-    }
-
-    const body = await readBody(req);
-    const controller = container.resolve(matched.route.controller) as Record<
-      string,
-      (...args: unknown[]) => unknown
-    >;
-    const args = await buildArgs(matched.route, {
-      body,
-      pathParams: matched.pathParams,
-      query: url.searchParams,
-    });
-
-    const result = await controller[matched.route.handlerName](...args);
-    sendJson(res, req.method === 'POST' ? 201 : 200, result);
+    matchStage(ctx);
+    ctx.body = await readBody(ctx.req);
+    ctx.result = await invokeStage(ctx);
+    serializeStage(ctx);
   } catch (error) {
     writeError(res, error);
   }
+}
+
+function matchStage(ctx: RequestContext): void {
+  const matched = matchRoute(ctx.routes, ctx.req.method ?? 'GET', ctx.url.pathname);
+  if (!matched) {
+    throw new HttpError(404, 'Not Found');
+  }
+  ctx.match = matched;
+}
+
+async function invokeStage(ctx: RequestContext): Promise<unknown> {
+  const { route, pathParams } = ctx.match!;
+  const controller = ctx.container.resolve(route.controller) as Record<
+    string,
+    (...args: unknown[]) => unknown
+  >;
+  const args = await buildArgs(route, {
+    body: ctx.body,
+    pathParams,
+    query: ctx.url.searchParams,
+  });
+  return controller[route.handlerName](...args);
+}
+
+function serializeStage(ctx: RequestContext): void {
+  const status = resolveStatus(ctx);
+  if (status === 204) {
+    ctx.res.writeHead(204);
+    ctx.res.end();
+    return;
+  }
+  sendJson(ctx.res, status, ctx.result);
+}
+
+function resolveStatus(ctx: RequestContext): number {
+  const route = ctx.match!.route;
+  const explicit = Reflect.getOwnMetadata(
+    HTTP_CODE,
+    route.controller.prototype,
+    route.handlerName,
+  ) as number | undefined;
+  if (typeof explicit === 'number') {
+    return explicit;
+  }
+  if (ctx.result === undefined) {
+    return 204;
+  }
+  return ctx.req.method === 'POST' ? 201 : 200;
 }
 
 async function buildArgs(

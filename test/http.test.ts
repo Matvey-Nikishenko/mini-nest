@@ -1,8 +1,12 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
+import { Controller } from '../src/decorators/controller.js';
+import { Get, HttpCode, Post } from '../src/decorators/methods.js';
+import { Param } from '../src/decorators/params.js';
 import { CreateUserDto } from '../src/dto/create-user.dto.js';
 import { createApp, type MiniNestApp } from '../src/dispatcher.js';
+import { collectRoutes } from '../src/router.js';
 import { UsersController } from '../src/users/users.controller.js';
 import { UsersService } from '../src/users/users.service.js';
 
@@ -85,5 +89,100 @@ describe('HTTP dispatcher', () => {
     const service = app.container.resolve(UsersService);
 
     assert.equal(controller.users, service);
+  });
+
+  it('returns 404 for an unknown path', async () => {
+    const response = await fetch(`${baseUrl}/nope-zzz`);
+    assert.equal(response.status, 404);
+  });
+});
+
+describe('route metadata isolation', () => {
+  it('does not append child routes onto the parent controller', () => {
+    @Controller('base')
+    class Base {
+      @Get('a')
+      a() {
+        return { via: 'a' };
+      }
+    }
+
+    @Controller('base')
+    class Child extends Base {
+      @Get('b')
+      b() {
+        return { via: 'b' };
+      }
+    }
+
+    const parent = collectRoutes([Base]).map((route) => route.path);
+    const child = collectRoutes([Child]).map((route) => route.path);
+
+    assert.deepEqual(parent, ['/base/a']);
+    assert.deepEqual(child, ['/base/b']);
+  });
+});
+
+describe('static routes win over params', () => {
+  let app: MiniNestApp;
+  let baseUrl: string;
+
+  before(async () => {
+    @Controller('shadow')
+    class ShadowController {
+      @Get(':id')
+      byId(@Param('id') id: string) {
+        return { via: 'param', id };
+      }
+
+      @Get('me')
+      me() {
+        return { via: 'static' };
+      }
+    }
+
+    app = createApp([ShadowController]);
+    baseUrl = await app.listen();
+  });
+
+  after(async () => {
+    await app.close();
+  });
+
+  it('matches /shadow/me with the static route even if :id was registered first', async () => {
+    const response = await fetch(`${baseUrl}/shadow/me`);
+    assert.deepEqual(await response.json(), { via: 'static' });
+  });
+
+  it('still binds parametric /shadow/:id', async () => {
+    const response = await fetch(`${baseUrl}/shadow/77`);
+    assert.deepEqual(await response.json(), { via: 'param', id: '77' });
+  });
+});
+
+describe('handler status', () => {
+  let app: MiniNestApp;
+  let baseUrl: string;
+
+  before(async () => {
+    @Controller('empty')
+    class EmptyController {
+      @Post()
+      @HttpCode(204)
+      noop() {}
+    }
+
+    app = createApp([EmptyController]);
+    baseUrl = await app.listen();
+  });
+
+  after(async () => {
+    await app.close();
+  });
+
+  it('lets the handler return 204 instead of POST 201', async () => {
+    const response = await fetch(`${baseUrl}/empty`, { method: 'POST' });
+    assert.equal(response.status, 204);
+    assert.equal(await response.text(), '');
   });
 });

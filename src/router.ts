@@ -28,12 +28,23 @@ export function pathToPattern(fullPath: string): { pattern: RegExp; paramNames: 
   return { pattern: new RegExp(`^${source}$`), paramNames };
 }
 
+export function normalizeRoutes(routes: CompiledRoute[]): CompiledRoute[] {
+  return [...routes].sort((left, right) => {
+    const leftParametric = left.paramNames.length > 0 ? 1 : 0;
+    const rightParametric = right.paramNames.length > 0 ? 1 : 0;
+    if (leftParametric !== rightParametric) {
+      return leftParametric - rightParametric;
+    }
+    return right.path.length - left.path.length;
+  });
+}
+
 export function collectRoutes(controllers: Constructor[]): CompiledRoute[] {
   const compiled: CompiledRoute[] = [];
 
   for (const controller of controllers) {
-    const prefix = (Reflect.getMetadata(CONTROLLER_PREFIX, controller) ?? '') as string;
-    const routes = (Reflect.getMetadata(ROUTES, controller) ?? []) as RouteMeta[];
+    const prefix = (Reflect.getOwnMetadata(CONTROLLER_PREFIX, controller) ?? '') as string;
+    const routes = (Reflect.getOwnMetadata(ROUTES, controller) ?? []) as RouteMeta[];
 
     for (const route of routes) {
       const fullPath = joinPath(prefix, route.path);
@@ -56,7 +67,7 @@ export function collectRoutes(controllers: Constructor[]): CompiledRoute[] {
     }
   }
 
-  return compiled;
+  return normalizeRoutes(compiled);
 }
 
 export function matchRoute(
