@@ -3,3 +3,4 @@ export { Inject } from './inject.js';
 export { Controller } from './controller.js';
 export { Get, HttpCode, Post } from './methods.js';
 export { Body, Param, Query } from './params.js';
+export { UseFilters, UseGuards, UseInterceptors, UsePipes } from './use-hooks.js';

@@ -2,18 +2,30 @@ import 'reflect-metadata';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Container } from './container.js';
 import { collectRoutes, matchRoute, type CompiledRoute } from './router.js';
-import { ValidationError, ValidationPipe } from './pipes/validation.pipe.js';
-import { HTTP_CODE } from './tokens.js';
+import { HTTP_CODE, USE_FILTERS, USE_GUARDS, USE_INTERCEPTORS, USE_PIPES } from './tokens.js';
 import type { Constructor } from './types.js';
+import { getRequestId, resolveRequestId, runWithRequestContext } from './context/request-context.js';
+import { NotFoundError, ValidationError } from './errors.js';
+import { AppExceptionFilter } from './filters/exception.filter.js';
+import { ExecutionContext } from './http/execution-context.js';
+import type {
+  CanActivate,
+  ExceptionFilter,
+  Interceptor,
+  Middleware,
+  PipeTransform,
+} from './http/interfaces.js';
+import { LoggingInterceptor } from './interceptors/logging.interceptor.js';
+import { ZodValidationPipe } from './pipes/zod-validation.pipe.js';
 
-export class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = 'HttpError';
-  }
+export interface CreateAppOptions {
+  controllers: Constructor[];
+  container?: Container;
+  middleware?: Middleware[];
+  guards?: Array<CanActivate | Constructor<CanActivate>>;
+  interceptors?: Array<Interceptor | Constructor<Interceptor>>;
+  pipes?: Array<PipeTransform | Constructor<PipeTransform>>;
+  filters?: Array<ExceptionFilter | Constructor<ExceptionFilter>>;
 }
 
 export interface MiniNestApp {
@@ -23,26 +35,35 @@ export interface MiniNestApp {
   close: () => Promise<void>;
 }
 
-type RequestContext = {
-  req: IncomingMessage;
-  res: ServerResponse;
-  routes: CompiledRoute[];
-  container: Container;
-  url: URL;
-  match?: { route: CompiledRoute; pathParams: Record<string, string> };
-  body?: unknown;
-  result?: unknown;
-};
-
-const pipe = new ValidationPipe();
+const defaultPipe = new ZodValidationPipe();
+const defaultInterceptor = new LoggingInterceptor();
+const defaultFilter = new AppExceptionFilter();
 
 export function createApp(
-  controllers: Constructor[],
-  container = new Container(),
+  controllersOrOptions: Constructor[] | CreateAppOptions,
+  containerArg?: Container,
 ): MiniNestApp {
-  const routes = collectRoutes(controllers);
+  const options = normalizeOptions(controllersOrOptions, containerArg);
+  const container = options.container ?? new Container();
+  const routes = collectRoutes(options.controllers);
+  const middleware = options.middleware ?? [];
+  const globalGuards = options.guards ?? [];
+  const globalInterceptors = options.interceptors ?? [defaultInterceptor];
+  const globalPipes = options.pipes ?? [defaultPipe];
+  const filters = options.filters ?? [defaultFilter];
+
   const server = createServer((req, res) => {
-    void handle(req, res, routes, container);
+    void handle({
+      req,
+      res,
+      routes,
+      container,
+      middleware,
+      globalGuards,
+      globalInterceptors,
+      globalPipes,
+      filters,
+    });
   });
 
   return {
@@ -68,93 +89,163 @@ export function createApp(
   };
 }
 
-async function handle(
-  req: IncomingMessage,
-  res: ServerResponse,
-  routes: CompiledRoute[],
+function normalizeOptions(
+  controllersOrOptions: Constructor[] | CreateAppOptions,
+  container?: Container,
+): CreateAppOptions {
+  if (Array.isArray(controllersOrOptions)) {
+    return { controllers: controllersOrOptions, container };
+  }
+  return controllersOrOptions;
+}
+
+async function handle(args: {
+  req: IncomingMessage;
+  res: ServerResponse;
+  routes: CompiledRoute[];
+  container: Container;
+  middleware: Middleware[];
+  globalGuards: Array<CanActivate | Constructor<CanActivate>>;
+  globalInterceptors: Array<Interceptor | Constructor<Interceptor>>;
+  globalPipes: Array<PipeTransform | Constructor<PipeTransform>>;
+  filters: Array<ExceptionFilter | Constructor<ExceptionFilter>>;
+}): Promise<void> {
+  const requestId = resolveRequestId(args.req.headers['x-request-id']);
+  const url = new URL(args.req.url ?? '/', 'http://127.0.0.1');
+  const ctx = new ExecutionContext(args.req, args.res, url, args.container);
+
+  await runWithRequestContext(requestId, async () => {
+    try {
+      for (const hook of args.middleware) {
+        await hook(ctx);
+      }
+
+      const matched = matchRoute(args.routes, args.req.method ?? 'GET', url.pathname);
+      if (!matched) {
+        throw new NotFoundError(`Cannot ${args.req.method ?? 'GET'} ${url.pathname}`);
+      }
+      ctx.match = matched;
+
+      const allowed = await runGuards(ctx, args.globalGuards);
+      if (!allowed) {
+        sendJson(args.res, 403, { statusCode: 403, message: 'Forbidden' });
+        return;
+      }
+
+      ctx.body = await readBody(args.req);
+      const result = await runInterceptors(ctx, args.globalInterceptors, () =>
+        invokeHandler(ctx, args.globalPipes),
+      );
+      serialize(ctx, result);
+    } catch (error) {
+      const filter = pickFilter(ctx, args.filters, args.container);
+      filter.catch(error, ctx);
+    }
+  });
+}
+
+function pickFilter(
+  ctx: ExecutionContext,
+  globalFilters: Array<ExceptionFilter | Constructor<ExceptionFilter>>,
   container: Container,
-): Promise<void> {
-  const ctx: RequestContext = {
-    req,
-    res,
-    routes,
-    container,
-    url: new URL(req.url ?? '/', 'http://127.0.0.1'),
-  };
-
-  try {
-    matchStage(ctx);
-    ctx.body = await readBody(ctx.req);
-    ctx.result = await invokeStage(ctx);
-    serializeStage(ctx);
-  } catch (error) {
-    writeError(res, error);
-  }
+): ExceptionFilter {
+  const refs = ctx.match
+    ? [
+        ...globalFilters,
+        ...readHooks<ExceptionFilter | Constructor<ExceptionFilter>>(
+          USE_FILTERS,
+          ctx.match.route.controller,
+          ctx.match.route.handlerName,
+        ),
+      ]
+    : globalFilters;
+  const chosen = refs.at(-1) ?? defaultFilter;
+  return resolveHook(chosen, container, (value): value is ExceptionFilter =>
+    typeof value === 'object' && value !== null && 'catch' in value,
+  );
 }
 
-function matchStage(ctx: RequestContext): void {
-  const matched = matchRoute(ctx.routes, ctx.req.method ?? 'GET', ctx.url.pathname);
-  if (!matched) {
-    throw new HttpError(404, 'Not Found');
+async function runGuards(
+  ctx: ExecutionContext,
+  globalGuards: Array<CanActivate | Constructor<CanActivate>>,
+): Promise<boolean> {
+  const route = ctx.match!.route;
+  const refs = [
+    ...globalGuards,
+    ...readHooks<CanActivate | Constructor<CanActivate>>(USE_GUARDS, route.controller, route.handlerName),
+  ];
+  for (const ref of refs) {
+    const guard = resolveHook(ref, ctx.container, (value): value is CanActivate =>
+      typeof value === 'object' && value !== null && 'canActivate' in value,
+    );
+    const allowed = await guard.canActivate(ctx);
+    if (!allowed) {
+      return false;
+    }
   }
-  ctx.match = matched;
+  return true;
 }
 
-async function invokeStage(ctx: RequestContext): Promise<unknown> {
+async function runInterceptors(
+  ctx: ExecutionContext,
+  globalInterceptors: Array<Interceptor | Constructor<Interceptor>>,
+  core: () => Promise<unknown>,
+): Promise<unknown> {
+  const route = ctx.match!.route;
+  const refs = [
+    ...globalInterceptors,
+    ...readHooks<Interceptor | Constructor<Interceptor>>(
+      USE_INTERCEPTORS,
+      route.controller,
+      route.handlerName,
+    ),
+  ];
+  const interceptors = refs.map((ref) =>
+    resolveHook(ref, ctx.container, (value): value is Interceptor =>
+      typeof value === 'object' && value !== null && 'intercept' in value,
+    ),
+  );
+
+  const invoke = interceptors.reduceRight<() => Promise<unknown>>(
+    (next, interceptor) => () => interceptor.intercept(ctx, next),
+    core,
+  );
+  return invoke();
+}
+
+async function invokeHandler(
+  ctx: ExecutionContext,
+  globalPipes: Array<PipeTransform | Constructor<PipeTransform>>,
+): Promise<unknown> {
   const { route, pathParams } = ctx.match!;
   const controller = ctx.container.resolve(route.controller) as Record<
     string,
     (...args: unknown[]) => unknown
   >;
-  const args = await buildArgs(route, {
-    body: ctx.body,
-    pathParams,
-    query: ctx.url.searchParams,
-  });
+  const args = await buildArgs(ctx, globalPipes, pathParams);
   return controller[route.handlerName](...args);
 }
 
-function serializeStage(ctx: RequestContext): void {
-  const status = resolveStatus(ctx);
-  if (status === 204) {
-    ctx.res.writeHead(204);
-    ctx.res.end();
-    return;
-  }
-  sendJson(ctx.res, status, ctx.result);
-}
-
-function resolveStatus(ctx: RequestContext): number {
-  const route = ctx.match!.route;
-  const explicit = Reflect.getOwnMetadata(
-    HTTP_CODE,
-    route.controller.prototype,
-    route.handlerName,
-  ) as number | undefined;
-  if (typeof explicit === 'number') {
-    return explicit;
-  }
-  if (ctx.result === undefined) {
-    return 204;
-  }
-  return ctx.req.method === 'POST' ? 201 : 200;
-}
-
 async function buildArgs(
-  route: CompiledRoute,
-  ctx: {
-    body: unknown;
-    pathParams: Record<string, string>;
-    query: URLSearchParams;
-  },
+  ctx: ExecutionContext,
+  globalPipes: Array<PipeTransform | Constructor<PipeTransform>>,
+  pathParams: Record<string, string>,
 ): Promise<unknown[]> {
+  const route = ctx.match!.route;
   const indexes = Object.keys(route.params).map(Number);
   const args: unknown[] = [];
-  const paramtypes = (Reflect.getMetadata(
-    'design:paramtypes',
-    route.controller.prototype,
-    route.handlerName,
-  ) ?? []) as Constructor[];
+  const pipes = [
+    ...globalPipes,
+    ...readHooks<PipeTransform | Constructor<PipeTransform>>(
+      USE_PIPES,
+      route.controller,
+      route.handlerName,
+    ),
+  ].map((ref) =>
+    resolveHook(ref, ctx.container, (value): value is PipeTransform =>
+      typeof value === 'object' && value !== null && 'transform' in value,
+    ),
+  );
 
   for (const index of indexes) {
     const meta = route.params[index];
@@ -162,16 +253,74 @@ async function buildArgs(
       continue;
     }
 
+    let value: unknown;
     if (meta.type === 'param') {
-      args[index] = ctx.pathParams[meta.name ?? ''];
+      value = pathParams[meta.name ?? ''];
     } else if (meta.type === 'query') {
-      args[index] = ctx.query.get(meta.name ?? '') ?? undefined;
+      value = ctx.url.searchParams.get(meta.name ?? '') ?? undefined;
     } else {
-      args[index] = await pipe.transform(ctx.body, paramtypes[index]);
+      value = ctx.body;
     }
+
+    for (const pipe of pipes) {
+      value = await pipe.transform(value, {
+        type: meta.type,
+        data: meta.name,
+        schema: meta.schema,
+      });
+    }
+    args[index] = value;
   }
 
   return args;
+}
+
+function serialize(ctx: ExecutionContext, result: unknown): void {
+  const route = ctx.match!.route;
+  const explicit = Reflect.getOwnMetadata(
+    HTTP_CODE,
+    route.controller.prototype,
+    route.handlerName,
+  ) as number | undefined;
+  const status =
+    typeof explicit === 'number'
+      ? explicit
+      : result === undefined
+        ? 204
+        : ctx.req.method === 'POST'
+          ? 201
+          : 200;
+
+  if (status === 204) {
+    ctx.res.writeHead(204, requestHeaders());
+    ctx.res.end();
+    return;
+  }
+  sendJson(ctx.res, status, result);
+}
+
+function readHooks<T>(key: symbol, controller: Constructor, handlerName: string): T[] {
+  const fromClass = (Reflect.getOwnMetadata(key, controller) ?? []) as T[];
+  const fromMethod = (Reflect.getOwnMetadata(key, controller.prototype, handlerName) ?? []) as T[];
+  return [...fromClass, ...fromMethod];
+}
+
+function resolveHook<T>(
+  ref: T | Constructor<T>,
+  container: Container,
+  isInstance: (value: unknown) => value is T,
+): T {
+  if (isInstance(ref)) {
+    return ref;
+  }
+  if (typeof ref === 'function') {
+    try {
+      return container.resolve(ref as Constructor<T>);
+    } catch {
+      return new (ref as Constructor<T>)();
+    }
+  }
+  return ref;
 }
 
 function readBody(req: IncomingMessage): Promise<unknown> {
@@ -192,7 +341,7 @@ function readBody(req: IncomingMessage): Promise<unknown> {
       try {
         resolve(JSON.parse(raw));
       } catch {
-        reject(new HttpError(400, 'Invalid JSON'));
+        reject(new ValidationError([{ field: 'body', constraints: ['Invalid JSON'] }]));
       }
     });
   });
@@ -203,19 +352,12 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
+    ...requestHeaders(),
   });
   res.end(body);
 }
 
-function writeError(res: ServerResponse, error: unknown): void {
-  if (error instanceof ValidationError) {
-    sendJson(res, 400, { statusCode: 400, errors: error.errors });
-    return;
-  }
-  if (error instanceof HttpError) {
-    sendJson(res, error.status, { statusCode: error.status, message: error.message });
-    return;
-  }
-  const message = error instanceof Error ? error.message : 'Internal Server Error';
-  sendJson(res, 500, { statusCode: 500, message });
+function requestHeaders(): Record<string, string> {
+  const requestId = getRequestId();
+  return requestId ? { 'x-request-id': requestId } : {};
 }
