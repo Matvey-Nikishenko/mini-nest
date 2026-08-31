@@ -15,6 +15,7 @@ export type ParamSource = 'body' | 'param' | 'query';
 export interface RouteParamMeta {
   type: ParamSource;
   name?: string;
+  schema?: unknown;
 }
 
 export type RouteParamsMap = Record<number, RouteParamMeta>;

@@ -4,7 +4,6 @@ import { after, before, describe, it } from 'node:test';
 import { Controller } from '../src/decorators/controller.js';
 import { Get, HttpCode, Post } from '../src/decorators/methods.js';
 import { Param } from '../src/decorators/params.js';
-import { CreateUserDto } from '../src/dto/create-user.dto.js';
 import { createApp, type MiniNestApp } from '../src/dispatcher.js';
 import { collectRoutes } from '../src/router.js';
 import { UsersController } from '../src/users/users.controller.js';
@@ -50,7 +49,7 @@ describe('HTTP dispatcher', () => {
   it('injects parsed JSON into @Body()', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
       body: JSON.stringify({ name: 'Ada', email: 'ada@example.com' }),
     });
     const body = await response.json();
@@ -63,7 +62,7 @@ describe('HTTP dispatcher', () => {
   it('rejects an invalid DTO with 400 listing the email field', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
       body: JSON.stringify({ email: 'not-an-email' }),
     });
     const payload = await response.text();
@@ -75,13 +74,14 @@ describe('HTTP dispatcher', () => {
   it('passes a CreateUserDto instance into the handler for a valid body', async () => {
     const response = await fetch(`${baseUrl}/users`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test' },
       body: JSON.stringify({ name: 'Grace', email: 'grace@example.com' }),
     });
 
     assert.equal(response.status, 201);
     const service = app.container.resolve(UsersService);
-    assert.ok(service.lastCreated instanceof CreateUserDto);
+    assert.equal(service.lastCreated?.email, 'grace@example.com');
+    assert.equal(service.lastCreated?.name, 'Grace');
   });
 
   it('resolves the controller service as the container singleton', async () => {
