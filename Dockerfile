@@ -17,4 +17,4 @@ RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 
 USER node
-CMD ["node", "--eval", "console.log('mini-nest part-1: IoC only, no HTTP server yet')"]
+CMD ["node", "dist/src/server.js"]
